@@ -38,6 +38,97 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <zlib.h>
+
+static void make_parent_dirs(char *path) {
+    for (char *p = path + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            mkdir(path, 0755);
+            *p = '/';
+        }
+    }
+}
+
+static void extract_embedded_datapack(ANativeActivity *act, const char *root) {
+    if (!act || !act->assetManager) return;
+    AAsset *a = AAssetManager_open(act->assetManager, "data.nxpk", AASSET_MODE_STREAMING);
+    if (!a) return;
+
+    LOG("found embedded data pack (data.nxpk): extracting to %s", root);
+    uint32_t magic = 0, count = 0;
+    if (AAsset_read(a, &magic, 4) != 4 || magic != 0x4B50584E) { // 'NXPK'
+        LOG("[RED] invalid magic in data.nxpk");
+        AAsset_close(a);
+        return;
+    }
+    if (AAsset_read(a, &count, 4) != 4) {
+        AAsset_close(a);
+        return;
+    }
+    LOG("data.nxpk contains %u files", count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint16_t plen = 0;
+        if (AAsset_read(a, &plen, 2) != 2) break;
+        char rel[512];
+        if (plen >= sizeof(rel)) plen = sizeof(rel) - 1;
+        if (AAsset_read(a, rel, plen) != plen) break;
+        rel[plen] = 0;
+
+        uint64_t orig_sz = 0, comp_sz = 0;
+        if (AAsset_read(a, &orig_sz, 8) != 8 || AAsset_read(a, &comp_sz, 8) != 8) break;
+
+        char out_path[1024];
+        snprintf(out_path, sizeof(out_path), "%s/%s", root, rel);
+
+        // Check if file already exists with same size
+        struct stat st;
+        if (stat(out_path, &st) == 0 && (uint64_t)st.st_size == orig_sz) {
+            AAsset_seek(a, comp_sz, SEEK_CUR);
+            continue;
+        }
+
+        make_parent_dirs(out_path);
+
+        void *comp_buf = malloc(comp_sz);
+        if (!comp_buf) {
+            LOG("[RED] oom allocating %llu bytes for %s", (unsigned long long)comp_sz, rel);
+            break;
+        }
+        if ((size_t)AAsset_read(a, comp_buf, comp_sz) != (size_t)comp_sz) {
+            free(comp_buf);
+            break;
+        }
+
+        void *orig_buf = malloc(orig_sz ? orig_sz : 1);
+        if (!orig_buf) {
+            free(comp_buf);
+            LOG("[RED] oom allocating %llu bytes for %s", (unsigned long long)orig_sz, rel);
+            break;
+        }
+
+        uLongf dest_len = orig_sz;
+        int zrc = uncompress((Bytef*)orig_buf, &dest_len, (const Bytef*)comp_buf, comp_sz);
+        free(comp_buf);
+
+        if (zrc == Z_OK && dest_len == orig_sz) {
+            char tmp_path[1050];
+            snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", out_path);
+            FILE *out_f = fopen(tmp_path, "wb");
+            if (out_f) {
+                if (orig_sz > 0) fwrite(orig_buf, 1, orig_sz, out_f);
+                fclose(out_f);
+                rename(tmp_path, out_path);
+            }
+        } else {
+            LOG("[RED] uncompress failed for %s (zrc=%d)", rel, zrc);
+        }
+        free(orig_buf);
+    }
+    AAsset_close(a);
+    LOG("data.nxpk extraction complete");
+}
 
 void front_run(void (*guest)(void)) { guest(); }
 void *front_metal_layer(void) { return NULL; }
@@ -1255,6 +1346,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     snprintf(p, sizeof p, "%s/log.txt", g_root); char prev[720]; snprintf(prev, sizeof prev, "%s/log.prev.txt", g_root); rename(p, prev);
     if (!freopen(p, "w", stderr)) __android_log_print(ANDROID_LOG_ERROR, "dmhost", "cannot write %s", p);
     setvbuf(stderr, NULL, _IOLBF, 0);
+    extract_embedded_datapack(act, g_root);
     setenv("DM_ROOT", g_root, 1);
     snprintf(p, sizeof p, "%s/RomFS", g_root); setenv("DM_ROMFS", p, 0);
     snprintf(p, sizeof p, "%s/save", act->internalDataPath); mkdir(p, 0700); setenv("DM_SAVE", p, 0);

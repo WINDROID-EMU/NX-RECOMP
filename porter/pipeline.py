@@ -44,6 +44,7 @@ class Options:
     vulkan_driver: Path = None         # an arm64 Vulkan driver (Mesa's Turnip) packed in the APK and used instead of the system's (DM_VK_DRIVER, dm/android/gfx_vk_core.c)
     shared_font: Path = None           # a TrueType font packed as the system's shared fonts, instead of the device's Roboto (DM_SHARED_FONT, dm/host/hle_sdk16.c)
     firmware: Path = None              # the player's system content files (.nca), for the profile's sysdata titles (extract_sysdata; DM_SYSDATA, dm/host/hle_fs.c)
+    embed_data: bool = False           # embed the data pack inside the APK as an asset (data.nxpk)
     mt_replay: bool = False            # multithread replay: DM_VK_MT_REPLAY=1 in env.txt (dm/android/gfx_vk_dq.c), after the profile's env rows
     touch: bool = False                # a game played by touch: the on-screen gamepad starts hidden (TOUCH_SETTINGS), so it takes none of the game's touches
     native_keyboard: bool = False      # optional Unicode Android IME (requires SDK/JDK)
@@ -232,8 +233,12 @@ class Port:
         if o.install: self.pull_captures()
         self.shaders()
         self.host()
-        self.apk()
-        self.data()
+        if o.embed_data:
+            self.data()
+            self.apk()
+        else:
+            self.apk()
+            self.data()
         if o.install: self.install()
         nsp.rmtree(self.work / 'tmp')
         self.result.update(title_id=self.g.id, name=self.app_name, package=self.package, version=self.pkg_ver, display=self.display, language=self.lang,
@@ -765,9 +770,12 @@ class Port:
         if driver and driver.name != driver_lib_name(driver):   # packed under a lib*.so name (driver_lib_name), copied beside the host library
             driver = self.so.parent / driver_lib_name(driver); shutil.copyfile(self.o.vulkan_driver, driver)
             say(f'--vulkan-driver: {self.o.vulkan_driver.name} is packed as {driver.name} (Android extracts only lib*.so libraries)')
+        embed_args = []
+        if self.o.embed_data:
+            embed_args = self.pack_embedded_data()
         nsp.run([PY, DM / 'android/apk/mkapk.py', self.so, self.apk_path, paths.signing_key(), '--package', self.package, '--label', self.app_name, '--lib', 'dmhost',
                  '--version-code', str(code), '--version-name', self.display]
-                + (['--landscape'] if self.ap.landscape else []) + icon + self.theme() + self.ui_font() + external + ([] if self.o.debug else ['--release'])
+                + (['--landscape'] if self.ap.landscape else []) + icon + self.theme() + self.ui_font() + external + embed_args + ([] if self.o.debug else ['--release'])
                 + [a for f in ([driver] + [self.so.parent / n for n in ADRENOTOOLS_LIBS] if driver else []) for a in ('--extra-so', str(f))],
                 self.logs / 'android_apk.log', env=self.env)
         self.result['apk'] = str(self.apk_path)
@@ -818,6 +826,26 @@ class Port:
         art.resize((layer, layer), Image.LANCZOS).filter(ImageFilter.GaussianBlur(24)).save(bg)
         top = Image.new('RGBA', (layer, layer)); top.paste(art.resize((shown, shown), Image.LANCZOS), ((layer - shown) // 2,) * 2); top.save(fg)
         return ['--icon', plain, '--icon-fg', fg, '--icon-bg', bg]
+
+    def pack_embedded_data(self):
+        import zlib, struct
+        out_nxpk = self.aw / 'data.nxpk'
+        files = sorted([p for p in self.data_path.rglob('*') if p.is_file()])
+        say(f'embedding data pack into APK: {len(files)} files...')
+        with open(out_nxpk, 'wb') as f:
+            f.write(b'NXPK')
+            f.write(struct.pack('<I', len(files)))
+            for p in files:
+                rel = p.relative_to(self.data_path).as_posix()
+                data = p.read_bytes()
+                cdata = zlib.compress(data, 9)
+                rel_bytes = rel.encode('utf-8')
+                f.write(struct.pack('<H', len(rel_bytes)))
+                f.write(rel_bytes)
+                f.write(struct.pack('<QQ', len(data), len(cdata)))
+                f.write(cdata)
+        say(f'embedded data pack: {out_nxpk.stat().st_size / 2**20:.1f} MB')
+        return ['--asset', f'data.nxpk={out_nxpk}']
 
     # ---- data: the files the app reads from its files folder ----
     def data(self):
