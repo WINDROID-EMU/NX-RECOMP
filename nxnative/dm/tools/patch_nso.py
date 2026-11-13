@@ -533,7 +533,7 @@ def check_before_copy(insl, ctx, ld, idx):
     src, kl = m.group(1), insl.index(ld)
     def writes(p):   # capstone lists a compare's first operand as written (cmp w18,#4 at main+0x2dd8c30); it only sets the flags
         return set() if p.mnemonic in ('cmp', 'cmn', 'tst') else {'w' + p.reg_name(r)[1:] for r in p.regs_access()[1]}
-    for q in range(kl - 3, max(0, kl - 64) - 1, -1):
+    for q in range(kl - 3, max(0, kl - 128) - 1, -1):
         p = insl[q]
         mm = re.fullmatch(r'(w\d+), (w\d+)', p.op_str) if p.mnemonic == 'mov' else None
         if mm and mm.group(1) in idx and mm.group(2) == src: break
