@@ -18,6 +18,7 @@ _p.add_argument('--release', action='store_true', help='not debuggable')
 _p.add_argument('--version-code', type=int, default=1, help='versionCode: a later port of the game must have a higher one to install over it')
 _p.add_argument('--version-name', default='1.0', help='versionName: the version the player sees (the game\'s display version)'); ARGS = _p.parse_args()
 PKG, LIB, LABEL = ARGS.package, ARGS.lib, ARGS.label
+if ARGS.dex and ARGS.activity == 'android.app.NativeActivity': ARGS.activity = 'org.nx2a.GameActivity'
 if ARGS.activity != 'android.app.NativeActivity' and not ARGS.dex: _p.error('--activity requires --dex')
 if bool(ARGS.icon_fg) != bool(ARGS.icon_bg) or (ARGS.icon_fg and not ARGS.icon): _p.error('--icon-fg and --icon-bg go together, with --icon')
 MIN_SDK, TARGET_SDK = 29, 36

@@ -25,6 +25,7 @@
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #include <android/sensor.h>
+#include <dirent.h>
 #include <errno.h>
 #include <dlfcn.h>
 #include <jni.h>
@@ -1317,9 +1318,46 @@ static void on_queue_created(ANativeActivity *a, AInputQueue *q) { (void)a; g_qu
 static void on_queue_destroyed(ANativeActivity *a, AInputQueue *q) { (void)a; AInputQueue_detachLooper(q); g_queue = NULL; }
 
 // ---- the host ----
+static pthread_mutex_t g_romfs_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_romfs_cond = PTHREAD_COND_INITIALIZER;
+static int g_romfs_ready = 0;
+
+static void set_romfs_path(const char *path) {
+    if (path && *path) {
+        setenv("DM_ROMFS", path, 1);
+        LOG("RomFS: configured to %s", path);
+    }
+    pthread_mutex_lock(&g_romfs_mu);
+    g_romfs_ready = 1;
+    pthread_cond_broadcast(&g_romfs_cond);
+    pthread_mutex_unlock(&g_romfs_mu);
+}
+
+JNIEXPORT void JNICALL Java_org_nx2a_GameStorage_nativeSetRomfs(JNIEnv *env, jclass cls, jstring path) {
+    (void)cls;
+    if (path) {
+        const char *p = (*env)->GetStringUTFChars(env, path, NULL);
+        if (p) {
+            set_romfs_path(p);
+            (*env)->ReleaseStringUTFChars(env, path, p);
+        }
+    }
+}
+
+JNIEXPORT void JNICALL Java_org_nx2a_GameActivity_nativeSetRomfs(JNIEnv *env, jclass cls, jstring path) {
+    Java_org_nx2a_GameStorage_nativeSetRomfs(env, cls, path);
+}
+
 int main(int argc, char **argv);   // dm/host/main.c
 static void *host_thread(void *a) {
     (void)a;
+    pthread_mutex_lock(&g_romfs_mu);
+    while (!g_romfs_ready && !g_quit) {
+        pthread_cond_wait(&g_romfs_cond, &g_romfs_mu);
+    }
+    pthread_mutex_unlock(&g_romfs_mu);
+    if (g_quit) return NULL;
+
     char mods[600]; snprintf(mods, sizeof mods, "%s/mods", g_root);
     char *argv[] = {"dmhost", mods, NULL};
     atomic_store(&g_running, 1);
@@ -1360,28 +1398,48 @@ static void open_access_page(ANativeActivity *act, int sdk) {   // the app's All
     } while (0);
     LOG("[RED] RomFS: Android's All files access page could not be opened: open it by hand (Settings > Apps > the game)");
 }
+
+static int romfs_dir_has_files(const char *path) {
+    if (!path || !*path) return 0;
+    DIR *d = opendir(path);
+    if (!d) return 0;
+    struct dirent *de;
+    int count = 0;
+    while ((de = readdir(d))) {
+        if (strcmp(de->d_name, ".") != 0 && strcmp(de->d_name, "..") != 0) {
+            count++;
+            break;
+        }
+    }
+    closedir(d);
+    return count > 0;
+}
+
 static int romfs_readable(ANativeActivity *act, int sdk) {   // 0: the game cannot read its RomFS, and the app ends
     const char *r = getenv("DM_ROMFS"), *own[] = {g_root, act->internalDataPath}; char rr[4096], orr[4096];
     const char *rp = r && realpath(r, rr) ? rr : r;   // canonical paths: /sdcard/… is the /storage/emulated/0/… Android names the files folder by
+    int is_own = 0;
     for (int i = 0; i < 2; i++) { const char *o = own[i] && realpath(own[i], orr) ? orr : own[i]; size_t n = o ? strlen(o) : 0;
-        if (!rp || (n && !strncmp(rp, o, n) && (rp[n] == '/' || !rp[n]))) return 1; }   // the app's own folders need no permission
+        if (rp && n && !strncmp(rp, o, n) && (rp[n] == '/' || !rp[n])) { is_own = 1; break; } }   // the app's own folders need no permission
     JNIEnv *E = act->env; jclass c; jmethodID m; int ok = -1;   // -1: not known
-    if (sdk >= 30) { c = (*E)->FindClass(E, "android/os/Environment"); m = c ? (*E)->GetStaticMethodID(E, c, "isExternalStorageManager", "()Z") : NULL; if (m) ok = (*E)->CallStaticBooleanMethod(E, c, m) ? 1 : 0; }
-    else { jstring s = (*E)->NewStringUTF(E, "android.permission.READ_EXTERNAL_STORAGE"); c = (*E)->GetObjectClass(E, act->clazz);
-           m = s ? (*E)->GetMethodID(E, c, "checkSelfPermission", "(Ljava/lang/String;)I") : NULL; if (m) ok = (*E)->CallIntMethod(E, act->clazz, m, s) == 0; }   // PERMISSION_GRANTED
-    if (jx(E)) ok = -1;
-    const char *what = sdk >= 30 ? "All files access" : "the storage permission (READ_EXTERNAL_STORAGE)";
-    if (!ok) {
-        LOG("[RED] RomFS: %s is outside the app's files folder, and the app does not have %s, so the game cannot read its files there: the game is not started. "
-            "Allow it on the device (%s), or install again with porter install, which grants it over adb; the app opens that page and ends",
-            r, what, sdk >= 30 ? "Settings > Apps > the game > All files access" : "Settings > Apps > the game > Permissions > Files and media");
-        open_access_page(act, sdk); return 0;
+    if (!is_own) {
+        if (sdk >= 30) { c = (*E)->FindClass(E, "android/os/Environment"); m = c ? (*E)->GetStaticMethodID(E, c, "isExternalStorageManager", "()Z") : NULL; if (m) ok = (*E)->CallStaticBooleanMethod(E, c, m) ? 1 : 0; }
+        else { jstring s = (*E)->NewStringUTF(E, "android.permission.READ_EXTERNAL_STORAGE"); c = (*E)->GetObjectClass(E, act->clazz);
+               m = s ? (*E)->GetMethodID(E, c, "checkSelfPermission", "(Ljava/lang/String;)I") : NULL; if (m) ok = (*E)->CallIntMethod(E, act->clazz, m, s) == 0; }   // PERMISSION_GRANTED
+        if (jx(E)) ok = -1;
+        const char *what = sdk >= 30 ? "All files access" : "the storage permission (READ_EXTERNAL_STORAGE)";
+        if (!ok) {
+            LOG("[RED] RomFS: %s is outside the app's files folder, and the app does not have %s", r ? r : "(null)", what);
+            return 0;
+        }
+        if (ok < 0) LOG("[RED] RomFS: %s is outside the app's files folder, and whether the app has %s is not known (a Java call failed): starting the game anyway", r, what);
     }
-    if (ok < 0) LOG("[RED] RomFS: %s is outside the app's files folder, and whether the app has %s is not known (a Java call failed): starting the game anyway", r, what);
-    struct stat st; int e = stat(r, &st) ? errno : S_ISDIR(st.st_mode) ? 0 : ENOTDIR;
-    if (e) { LOG("[RED] RomFS: %s is not there (errno=%d): an SD card that is not in, or a folder moved or renamed; porter install --romfs-at <folder> points the app at it "
-                 "(--romfs-at app: back into the files folder). The game is not started", r, e); return 0; }
-    LOG("RomFS: %s, outside the app's files folder (%s granted)", r, what);
+    struct stat st; int e = (!r || stat(r, &st)) ? errno : S_ISDIR(st.st_mode) ? 0 : ENOTDIR;
+    if (e || !romfs_dir_has_files(r)) {
+        LOG("[RED] RomFS: %s is not there or empty (errno=%d)", r ? r : "(null)", e);
+        return 0;
+    }
+    LOG("RomFS: %s, readable and ready", r);
     return 1;
 }
 __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActivity *act, void *saved, size_t saved_size) {
@@ -1416,7 +1474,28 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
 #endif
     // the save manager's requests (saves_android.c), before the host mounts the save: an import chosen in the menu or pushed by porter, an export porter asks for
     if (dm_saves_start(g_root)) { LOG("[saves] the request asked the app to end: the game is not started"); g_quit = 1; return; }
-    if (!romfs_readable(act, sdk)) { g_quit = 1; return; }   // after the save manager's requests, which need no RomFS
+    jclass cA = (*env)->GetObjectClass(env, act->clazz);
+    jmethodID mEnsure = cA ? (*env)->GetMethodID(env, cA, "ensureRomfs", "()V") : NULL;
+    if (jx(env)) mEnsure = NULL;
+    if (cA) (*env)->DeleteLocalRef(env, cA);
+
+    if (!romfs_readable(act, sdk)) {
+        if (mEnsure) {
+            LOG("RomFS: data not ready, requesting storage permission and folder selection from user");
+            (*env)->CallVoidMethod(env, act->clazz, mEnsure);
+            if (jx(env)) (*env)->ExceptionClear(env);
+        } else {
+            LOG("[RED] RomFS: not readable and no Java UI available; opening settings page and ending");
+            open_access_page(act, sdk);
+            g_quit = 1;
+            return;
+        }
+    } else {
+        pthread_mutex_lock(&g_romfs_mu);
+        g_romfs_ready = 1;
+        pthread_cond_broadcast(&g_romfs_cond);
+        pthread_mutex_unlock(&g_romfs_mu);
+    }
     settings_load(); dm_haptics_android_start(act, atomic_load(&g_set_rumble)); dm_lan_android_start(act);
     { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, act->vm)) pthread_detach(w); }
     { pthread_t w; if (!pthread_create(&w, NULL, temp_watch, act->vm)) pthread_detach(w); }
