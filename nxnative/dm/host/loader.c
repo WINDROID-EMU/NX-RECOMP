@@ -139,12 +139,14 @@ void *guest_sym(const char *name) {
     pthread_rwlock_rdlock(&g_modules_mu); void *p = loaded_sym(name); pthread_rwlock_unlock(&g_modules_mu);
     return p;
 }
-// For modules with the patch area before the base (patch_off < 0) addresses in the patch area count too, as for modules whose patch area follows the image (crash reports, the GC pause's "in guest code" test)
+// For modules with the patch area before the base (patch_off < 0) addresses in the patch area count too, as for modules whose patch area follows the image (crash reports, the GC pause's "in guest code" test);
+// a second patch area after the key page (patch2_len) lies past the image, so it is tested separately
 module_t *module_of(const void *p) {
     for (int i = 0; i < g_nmod; i++) {
         const uint8_t *b = g_mod[i].base;
         if ((const uint8_t *)p >= b && (const uint8_t *)p < b + g_mod[i].size) return &g_mod[i];
         if (g_mod[i].patch_off < 0 && (const uint8_t *)p >= b + g_mod[i].patch_off && (const uint8_t *)p < b + g_mod[i].patch_off + g_mod[i].patch_len) return &g_mod[i];
+        if (g_mod[i].patch2_len && (const uint8_t *)p >= b + g_mod[i].patch2_off && (const uint8_t *)p < b + g_mod[i].patch2_off + g_mod[i].patch2_len) return &g_mod[i];
     }
     return NULL;
 }
@@ -221,6 +223,8 @@ static void read_layout(module_t *m, const char *dir) {
         if (!strcmp(key, "PATCH_OFF")) m->patch_off = strtoll(line + 2 + strlen(key), NULL, 16);   // may be negative (patch area before the base)
         else if (!strcmp(key, "IMAGE_SIZE")) m->image_size = v;
         else if (!strcmp(key, "FILE_IMAGE_LEN")) m->file_image_len = v;
+        else if (!strcmp(key, "PATCH2_OFF")) m->patch2_off = v;   // a second patch area after the key page (patch_nso.py TWO_AREAS)
+        else if (!strcmp(key, "PATCH2_LEN")) m->patch2_len = v;
         else if (!strcmp(key, "KEY_PAGE_OFF")) m->key_page_off = v;
         else if (!strcmp(key, "KEY_PAGE_SIZE")) m->key_page_size = v;
         else if (!strcmp(key, "TEXT_END")) m->text_end = v;
@@ -246,6 +250,8 @@ static void read_layout(module_t *m, const char *dir) {
         die("%s: the output comes from an old rewriter; rewrite the modules again with dm/tools/patch_nso.py", path);
     if (m->patch_off < 0 && (!m->image_size || !m->file_image_len || m->file_image_len % 0x4000 || m->patch_off % 0x4000 || m->key_page_off + m->key_page_size > m->image_size))
         die("%s: patch area before the base, but IMAGE_SIZE / FILE_IMAGE_LEN missing or wrong", path);
+    if (m->patch2_len && (m->patch_off >= 0 || m->patch2_off % 0x4000 || m->patch2_off < m->image_size || m->patch2_len % 0x4000))
+        die("%s: second patch area, but PATCH2_OFF / PATCH2_LEN missing or wrong", path);
 }
 
 // Frame step state (the page after the key page, read-write; layout in patch_nso.py FRAME_STEP): the rewriter's stubs step the game by the host's whole vsyncs capped at this
@@ -505,7 +511,7 @@ void loader_hash_log(void) {
 
 #if TARGET_OS_IPHONE
 // iOS does not allow code loaded at run time to execute, and Apple allows an executable only one segment with execute permission (ITMS-90999): the image is compiled into this executable by dm/ios/tools/gen_embed.py --
-// the two code blocks (original text, patch area) are sections in __TEXT, and W (the rest of ro + data + bss) is a separate RW segment. The three blocks are not adjacent in the file; here one contiguous address range is reserved,
+// the code blocks (original text, patch area, and a module's second patch area) are sections in __TEXT, and W (the rest of ro + data + bss) is a separate RW segment. The three blocks are not adjacent in the file; here one contiguous address range is reserved,
 // and they are vm_remap'ed back at their original relative positions: code pages with copy=FALSE (sharing the same signed pages with __TEXT, r-x), W with copy=TRUE (copy-on-write, paged only when used).
 // The run-time layout is byte-identical to the original image. Remapping signed pages to a new address and then executing them on iOS is exactly what libffi's trampoline table (FFI_EXEC_TRAMPOLINE_TABLE) does
 #include <mach/mach.h>
@@ -533,25 +539,31 @@ static int nro_pieces(const char *name, const uint8_t **x0, unsigned long *z0, c
 }
 static void map_image(module_t *m, const char *dir) {
     (void)dir;
-    char sx0[17], sx1[17], dm[17]; snprintf(sx0, sizeof sx0, "__dm%sx0", m->name); snprintf(sx1, sizeof sx1, "__dm%sx1", m->name); snprintf(dm, sizeof dm, "__DM%sW", m->name);
-    unsigned long z0 = 0, zw = 0, z1 = 0;
-    const uint8_t *x0 = NULL, *w = NULL, *x1 = NULL;
+    char sx0[17], sx1[17], sx2[17], dm[17]; snprintf(sx0, sizeof sx0, "__dm%sx0", m->name); snprintf(sx1, sizeof sx1, "__dm%sx1", m->name); snprintf(dm, sizeof dm, "__DM%sW", m->name);
+    snprintf(sx2, sizeof sx2, "__dm%sx2", m->name);
+    unsigned long z0 = 0, zw = 0, z1 = 0, z2 = 0;
+    const uint8_t *x0 = NULL, *w = NULL, *x1 = NULL, *x2 = NULL;
     if (m->nro) { if (!nro_pieces(m->name, &x0, &z0, &w, &zw, &x1, &z1)) die("NRO %s: not in the embedded NRO table (__DATA,__dm_nro_tab)", m->name); }
-    else { x0 = getsectiondata(IMAGE_MH, "__TEXT", sx0, &z0); w = getsectiondata(IMAGE_MH, dm, "__img", &zw); x1 = getsectiondata(IMAGE_MH, "__TEXT", sx1, &z1); }
+    else { x0 = getsectiondata(IMAGE_MH, "__TEXT", sx0, &z0); w = getsectiondata(IMAGE_MH, dm, "__img", &zw); x1 = getsectiondata(IMAGE_MH, "__TEXT", sx1, &z1);
+           if (m->patch2_len) x2 = getsectiondata(IMAGE_MH, "__TEXT", sx2, &z2); }   // second patch area (patch_nso.py TWO_AREAS)
     if (!x0 || !w || !x1) die("embedded sections %s / %s / %s missing", sx0, dm, sx1);
     // Patch area before the base (patch_off < 0): W ends at the end of data (FILE_IMAGE_LEN); bss and the key page are zero pages from vm_allocate and are not in the executable
     int front = m->patch_off < 0;
     if (z0 + zw != (front ? m->file_image_len : (uint64_t)m->patch_off) || (z0 & 0x3FFF) || (zw & 0x3FFF) || (z1 & 0x3FFF) || ((uintptr_t)x0 & 0x3FFF) || ((uintptr_t)w & 0x3FFF) || ((uintptr_t)x1 & 0x3FFF))
         die("%s embedded section layout mismatch (x0 %#lx w %#lx x1 %#lx, PATCH_OFF %#llx)", m->name, z0, zw, z1, (unsigned long long)m->patch_off);
+    if (m->patch2_len && (!x2 || z2 != m->patch2_len || ((uintptr_t)x2 & 0x3FFF)))
+        die("%s second patch area: section %s missing or %#lx bytes, PATCH2_LEN %#llx", m->name, sx2, z2, (unsigned long long)m->patch2_len);
     m->size = front ? m->image_size : m->patch_off + z1;
     uint64_t pre = front ? (uint64_t)-m->patch_off : 0;
     if (front) m->patch_len = z1;
+    uint64_t span = pre + (m->patch2_len ? m->patch2_off + m->patch2_len : m->size);   // area B lies past the image
     vm_address_t base = 0;
-    if (vm_allocate(mach_task_self(), &base, pre + m->size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) die("%s failed to reserve %#llx bytes of address space", m->name, (unsigned long long)(pre + m->size));
+    if (vm_allocate(mach_task_self(), &base, span, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) die("%s failed to reserve %#llx bytes of address space", m->name, (unsigned long long)span);
     base += pre;
     remap_at(m, base, x0, z0, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
     remap_at(m, base + z0, w, zw, TRUE, VM_PROT_READ | VM_PROT_WRITE);
     remap_at(m, base + m->patch_off, x1, z1, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    if (m->patch2_len) remap_at(m, base + m->patch2_off, x2, z2, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
     m->base = (uint8_t *)base; install_key_page(m);
 }
 #else
@@ -564,35 +576,50 @@ static uint8_t *slurp(const char *path, size_t *n) {
     close(fd); *n = st.st_size; return p;
 }
 
-// Seal the code area immediately after copying into anonymous pages (16 KB pages): [0, text_end) and the patch area are read-only+execute, and from then on any write to the code area crashes on the spot;
-// what lies between (ro and data on the same page can only go together) is writable
+// Seal the code area immediately after copying into anonymous pages (16 KB pages): every page that holds nothing but text becomes read-only+execute, and from then on any write to the code area crashes on the spot.
+// The page that holds the text's last bytes usually holds ro too (read-only either way), but a small NRO of a few KB starts its writable data in that same page (text 0x1000, ro 0x1000,
+// data 0x2000): that page stays executable and writable (RWX), or the module's own data would be read-only and the loader would crash writing its first relocation slot (nro0+0x2000)
+static void seal_text(module_t *m) {
+    uint64_t full = m->text_end & ~0x3FFFull;   // whole pages that hold nothing but text
+    if (full && mprotect(m->base, full, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
+    if (m->text_end == full) return;            // the text ends on a page boundary
+    int data_here = m->data_off < full + 0x4000;
+    if (mprotect(m->base + full, 0x4000, PROT_READ | PROT_EXEC | (data_here ? PROT_WRITE : 0))) die("%s mprotect text tail", m->name);
+}
+
 static void map_image(module_t *m, const char *dir) {
     char path[1024]; snprintf(path, sizeof path, "%s/%s.patched.bin", dir, m->name);
     size_t sz; uint8_t *raw = slurp(path, &sz);
     if (m->patch_off < 0) {
         // Patch area before the base: file = the first part of the image (text + ro + data) + patch area; bss and the key page are anonymous zero pages. The gap from the patch area's end to the base is left inaccessible (PROT_NONE)
-        uint64_t pre = (uint64_t)-m->patch_off, fl = m->file_image_len;
+        // A text longer than a b reaches has a second patch area after the key page (patch_nso.py TWO_AREAS): the file holds A (FRONT bytes, padded) and then B, which is mapped at PATCH2_OFF,
+        // right past the key page; A is then the whole FRONT, so the gap before the base is fully taken
+        uint64_t pre = (uint64_t)-m->patch_off, fl = m->file_image_len, p2 = m->patch2_len;
         if (sz < fl) die("%s is shorter than FILE_IMAGE_LEN %#llx", path, (unsigned long long)fl);
-        m->size = m->image_size; m->patch_len = (sz - fl + 0x3FFF) & ~0x3FFFull;
-        if (m->patch_len > pre) die("%s patch area of %#llx bytes does not fit in the %#llx before the base", path, (unsigned long long)m->patch_len, (unsigned long long)pre);
-        uint8_t *a = mmap(NULL, pre + m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-        if (a == MAP_FAILED) die("%s mmap %#llx", m->name, (unsigned long long)(pre + m->size));
+        if (p2 && sz != fl + pre + p2) die("%s is %#zx bytes, expected FILE_IMAGE_LEN + the two patch areas (%#llx)", path, sz, (unsigned long long)(fl + pre + p2));
+        uint64_t a_len = sz - fl - p2;   // area A's bytes in the file (the rewriter pads it to FRONT with TWO_AREAS, otherwise it holds only the stubs)
+        m->size = m->image_size; m->patch_len = p2 ? pre : (a_len + 0x3FFF) & ~0x3FFFull;
+        if (a_len > pre) die("%s patch area of %#llx bytes does not fit in the %#llx before the base", path, (unsigned long long)a_len, (unsigned long long)pre);
+        uint64_t span = pre + (p2 ? m->patch2_off + p2 : m->size);
+        uint8_t *a = mmap(NULL, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (a == MAP_FAILED) die("%s mmap %#llx", m->name, (unsigned long long)span);
         m->base = a + pre;
-        memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - fl); free(raw); install_key_page(m);
-        uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
-        if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
+        memcpy(m->base, raw, fl); memcpy(a, raw + fl, a_len);
+        if (p2) memcpy(m->base + m->patch2_off, raw + fl + pre, p2);
+        free(raw); install_key_page(m);
+        seal_text(m);
         if (mprotect(a, m->patch_len, PROT_READ | PROT_EXEC)) die("%s mprotect patch", m->name);
         if (pre > m->patch_len && mprotect(a + m->patch_len, pre - m->patch_len, PROT_NONE)) die("%s mprotect gap", m->name);
+        if (p2 && mprotect(m->base + m->patch2_off, p2, PROT_READ | PROT_EXEC)) die("%s mprotect patch2", m->name);
         return;
     }
     m->size = (sz + 0x3FFF) & ~0x3FFFull;
     m->base = mmap(NULL, m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (m->base == MAP_FAILED) die("%s mmap", m->name);
     memcpy(m->base, raw, sz); free(raw); install_key_page(m);
-    uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
-    if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
+    seal_text(m);
     uint64_t po = m->patch_off & ~0x3FFFull;
-    if (mprotect(m->base + po, m->size - po, PROT_READ | PROT_EXEC)) die("%s mprotect patch", m->name);
+    if (m->size > po && mprotect(m->base + po, m->size - po, PROT_READ | PROT_EXEC)) die("%s mprotect patch", m->name);
 }
 #endif
 
