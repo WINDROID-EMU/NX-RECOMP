@@ -336,6 +336,10 @@ static Result au_open_at(void *g, void *ev, const char *name, const uint8_t *par
 }
 HLE_FORCE("_ZN2nn5audio12OpenAudioOutEPNS0_8AudioOutEPNS_2os11SystemEventEPKcRKNS0_17AudioOutParameterE", "connect to the audout service; host AudioUnit / silent sink",
           Result, h_au_Open, void *g, void *ev, const char *name, const uint8_t *param) { return au_open_at(g, ev, name, param, __builtin_return_address(0)); }
+// SDK 13 and earlier: OpenAudioOut without a SystemEvent, the signature the SDK ships before the release event was handed to the caller (Death's Gambit: Afterlife imports only this one, and the SDK's own implementation
+// connected to the audout service itself, which the host does not serve: the app aborted right after the connection). The release event stays the host's, unbound, and the game polls GetReleasedAudioOutBuffer
+HLE_FORCE("_ZN2nn5audio12OpenAudioOutEPNS0_8AudioOutEPKcRKNS0_17AudioOutParameterE", "connect to the audout service (no buffer event: the game polls); host AudioUnit / silent sink",
+          Result, h_au_OpenNoEvName, void *g, const char *name, const uint8_t *param) { return au_open_at(g, NULL, name, param, __builtin_return_address(0)); }
 // The two default-device overloads (Engage, SDK 12): as OpenAudioOut with the default device name; the overload without an event binds no release event (the game polls GetReleasedAudioOutBuffer)
 HLE_FORCE("_ZN2nn5audio19OpenDefaultAudioOutEPNS0_8AudioOutEPNS_2os11SystemEventERKNS0_17AudioOutParameterE", "connect to the audout service (default device); same as OpenAudioOut",
           Result, h_au_OpenDef, void *g, void *ev, const uint8_t *param) { return au_open_at(g, ev, NULL, param, __builtin_return_address(0)); }

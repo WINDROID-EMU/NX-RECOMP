@@ -1056,6 +1056,17 @@ void hle_signal_system_event(void *ev) {   // An unbound one is bound on the spo
         }
         pthread_mutex_unlock(&G);
         if (bound) die("SystemEvent %p still not found after binding", ev);
+        // A host thread (the audio output's release thread, a front-end helper) cannot bind: binding runs SDK code and needs the guest thread's TLS. The game destroyed the event (or reused
+        // its memory), so there is nobody left to wake: drop the signal and say so once per address, instead of aborting the whole app
+        if (!pthread_getspecific(g_keythr)) {
+            static void *said[8]; static _Atomic int ns;
+            for (int i = 0; i < 8; i++) if (said[i] == ev) return;
+            int k = atomic_fetch_add(&ns, 1);
+            // not a red line: the game closed an output and its release event with it while one release signal was already in flight (Death's Gambit: Afterlife does this on the audio probe it closes
+            // right after opening, main+0x8003094); a signal for an event nobody owns is simply dropped
+            if (k < 8) { said[k] = ev; LOG("SystemEvent %p: the game destroyed it (the audio output it belonged to was closed) and this host thread cannot bind it: the release signal is dropped", ev); }
+            return;
+        }
         hle_bind_system_event(ev, 0);   // guest code (SVCs take G): outside the lock
     }
 }

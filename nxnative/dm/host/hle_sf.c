@@ -15,9 +15,11 @@
 
 #define SF_H0 0xd0000u   // session handles: outside the kernel handle table (0x1000 + slot, 4096 slots, hle_thread.c)
 #define SF_MAX 64
-static struct { char name[16]; int used, domain; unsigned seen; } g_sf[SF_MAX];
+static struct { char name[16]; int used, domain; unsigned seen; uint32_t ev; unsigned pend; } g_sf[SF_MAX];
 static pthread_mutex_t g_sf_mu = PTHREAD_MUTEX_INITIALIZER;
 static const char *const sf_served[] = {"olsc:u", "bt", "btm:u"};
+// Audio is not served here: the host takes over nn::audio itself (hle_audio.c, hle_audren.c), so a game that still reaches the audout service has an audio entry point the host does not hook -- refused with a red line
+// rather than answered with a stub that only looks like a device.
 int svc_thread(int num, uint64_t *regs);
 
 static uint32_t sf_event(void) {
@@ -34,7 +36,7 @@ static uint32_t sf_new(const char *name, int domain) {
     pthread_mutex_lock(&g_sf_mu);
     unsigned i = 0; while (i < SF_MAX && g_sf[i].used) i++;
     if (i == SF_MAX) die("sf: more than %d host service sessions", SF_MAX);
-    strlcpy(g_sf[i].name, name, sizeof g_sf[i].name); g_sf[i].used = 1; g_sf[i].domain = domain; g_sf[i].seen = 0;
+    strlcpy(g_sf[i].name, name, sizeof g_sf[i].name); g_sf[i].used = 1; g_sf[i].domain = domain; g_sf[i].seen = 0; g_sf[i].ev = 0; g_sf[i].pend = 0;
     pthread_mutex_unlock(&g_sf_mu);
     return SF_H0 + i;
 }
@@ -78,10 +80,14 @@ HLE_FORCE("_ZN2nn2sf4hipc15SendSyncRequestENS_3svc6HandleEPvm", "send a request 
     int i = sf_slot(h);
     if (i < 0 || size < 0x40) { LOG("[RED] sf: SendSyncRequest on %#x (%llu bytes), not a host session", h, (unsigned long long)size); return 0xe401u; }   // kernel ResultInvalidHandle
     uint8_t *base = (uint8_t *)m;
-    unsigned type = m[0] & 0xffff, nx = m[0] >> 16 & 15, nabw = (m[0] >> 20 & 15) + (m[0] >> 24 & 15) + (m[0] >> 28 & 15), ndw = m[1] & 0x3ff;
+    unsigned type = m[0] & 0xffff, nx = m[0] >> 16 & 15, na = (m[0] >> 20) & 15, nb = (m[0] >> 24) & 15, nw = (m[0] >> 28) & 15, ndw = m[1] & 0x3ff;
     uint32_t *p = m + 2;
     if (m[1] >> 31) { uint32_t sh = *p++; p += (sh & 1 ? 2 : 0) + (sh >> 1 & 15) + (sh >> 5 & 15); }   // special header: process ID, copy and move handles
-    p += nx * 2 + nabw * 3;
+    uint32_t *xdesc = p; p += nx * 2;
+    uint32_t *adesc = p; p += na * 3;
+    uint32_t *bdesc = p; p += nb * 3;
+    uint32_t *wdesc = p; p += nw * 3;
+    (void)xdesc; (void)bdesc; (void)wdesc;
     size_t data = (size_t)((uint8_t *)p - base), cm = (data + 15) & ~(size_t)15;
     int dom = g_sf[i].domain && (type == 4 || type == 6);
     unsigned dtype = dom ? base[cm] : 1, obj = dom ? *(uint32_t *)(base + cm + 4) : 0;
@@ -89,13 +95,15 @@ HLE_FORCE("_ZN2nn2sf4hipc15SendSyncRequestENS_3svc6HandleEPvm", "send a request 
     if (hin + 16 > size || data + ndw * 4 > size) { LOG("[RED] sf: %s: request of %u data words does not fit %llu bytes", g_sf[i].name, ndw, (unsigned long long)size); return 0xe401u; }
     uint32_t magic = *(uint32_t *)(base + hin), ver = *(uint32_t *)(base + hin + 4), cmd = *(uint32_t *)(base + hin + 8);
     static int trace = -1; if (trace < 0) trace = getenv("DM_SF_TRACE") && atoi(getenv("DM_SF_TRACE"));
-    if (trace) { char hx[3 * 0x80 + 1] = ""; for (unsigned k = 0; k < 0x80 && k < size; k++) snprintf(hx + 3 * k, 4, "%02x ", base[k]); LOG("sf: %s request: %s", g_sf[i].name, hx); }
+    int atrace = trace;
+    if (atrace) { char hx[3 * 0x80 + 1] = ""; for (unsigned k = 0; k < 0x80 && k < size; k++) snprintf(hx + 3 * k, 4, "%02x ", base[k]); LOG("sf: %s request(type %u dom %d obj %u dtype %u): %s", g_sf[i].name, type, dom, obj, dtype, hx); }
+    if (type == 2) { return RES_OK; }   // session close
     if (type != 4 && type != 6) { LOG("[RED] sf: %s: HIPC message type %u not served", g_sf[i].name, type); return 0xe401u; }
     if (dtype == 2) { memset(base, 0, 16); return RES_OK; }   // a domain object closed: nothing to answer
     if (magic != 0x49434653) { LOG("[RED] sf: %s: request without SFCI (%#x)", g_sf[i].name, magic); return 0xe401u; }
     unsigned key = (obj & 0xff) << 16 | (cmd & 0xffff);   // log each object / command once
     pthread_mutex_lock(&g_sf_mu); int first = g_sf[i].seen != key; g_sf[i].seen = key; pthread_mutex_unlock(&g_sf_mu);
-    uint32_t handle = 0, special = 0, child = 0; int acquired = 0; Result result = RES_OK;
+    uint32_t handle = 0, handle2 = 0, special = 0, child = 0; int acquired = 0; Result result = RES_OK;
     if (!strcmp(g_sf[i].name, "bt")) {
         if (cmd == 9) { handle = sf_event(); special = 2; }   // RegisterBleEvent: one copied event handle
         else result = RES_FAIL;   // no connected GATT peers or pending LE events
@@ -114,12 +122,19 @@ HLE_FORCE("_ZN2nn2sf4hipc15SendSyncRequestENS_3svc6HandleEPvm", "send a request 
         default: result = RES_FAIL; break;   // cannot connect, pair or configure a device that is absent
         }
     }
-    if (first || trace) LOG("sf: %s object %u command %u (%u data words in): result %#x, handle %#x, child %u", g_sf[i].name, obj, cmd, ndw, result, handle, child);
+    if (first || trace || atrace) LOG("sf: %s object %u command %u (%u data words in): result %#x, handle %#x, handle2 %#x, child %u", g_sf[i].name, obj, cmd, ndw, result, handle, handle2, child);
     // The response: no special header and no descriptors, so the data words start at +8 and the CMIF part at +0x10; everything after the headers up to the buffer's end reads as zero
     size_t end = size < 0x1000 ? size : 0x1000;
     memset(base, 0, end);
-    m[1] = (uint32_t)((end - (special ? 16 : 8)) / 4 < 0x3ff ? (end - (special ? 16 : 8)) / 4 : 0x3ff);
-    if (special) { m[1] |= 0x80000000u; m[2] = special; m[3] = handle; }
+    unsigned ncopy = (special & 2) ? 1 : 0, nmove = (special & 0x20) ? 1 : 0;
+    unsigned hdr_words = 2 + (special ? 1 : 0) + ncopy + nmove;
+    m[1] = (uint32_t)((end - hdr_words * 4) / 4 < 0x3ff ? (end - hdr_words * 4) / 4 : 0x3ff);
+    if (special) {
+        m[1] |= 0x80000000u; m[2] = special;
+        uint32_t *hp = &m[3];
+        if (ncopy) *hp++ = handle2 ? handle2 : handle;
+        if (nmove) *hp++ = handle;
+    }
     size_t out = 0x10 + (dom ? 16 : 0);
     uint32_t *o = (uint32_t *)(base + out); o[0] = 0x4f434653; o[1] = ver; o[2] = result; o[3] = 0;   // "SFCO"; a domain's out-object count before it stays 0
     if (child) { *(uint32_t *)(base + 0x10) = 1; o[4] = child; }
