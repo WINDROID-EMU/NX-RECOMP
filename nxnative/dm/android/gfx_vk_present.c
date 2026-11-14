@@ -874,10 +874,24 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     VkClearColorValue black = {{0, 0, 0, 1}}; VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(cb, tgt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rg);
     int cx = crop ? crop[0] : 0, cy = crop ? crop[1] : 0, cw = crop && crop[2] ? crop[2] : (int)im->w, ch = crop && crop[3] ? crop[3] : (int)im->h;
-    double s = fmin((double)g_sext.width / cw, (double)g_sext.height / ch); int dw = (int)(cw * s), dh = (int)(ch * s), dx = ((int)g_sext.width - dw) / 2, dy = ((int)g_sext.height - dh) / 2;
-    vk_pic_set((float)dx / g_sext.width, (float)dy / g_sext.height, (float)dw / g_sext.width, (float)dh / g_sext.height);
-    VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{cx, cy, 0}, {cx + cw, cy + ch, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
-    if (vk_window_bottom_up()) { b.srcOffsets[0].y = cy + ch; b.srcOffsets[1].y = cy; }   // lower-left origin: the window image is stored bottom-up (gfx_vk_exec.c)
+    // The picture's place in the window: fit keeps the aspect and borders it black (the default), fill stretches it to the whole window, crop keeps the aspect and cuts the
+    // overflow. A 16:9 game on a 20:9 phone covers the screen only one of the last two ways; DM_SCALE=fit|fill|crop chooses (a game whose frame is the window's shape is
+    // the same in all three)
+    static int mode = -1;
+    if (mode < 0) { const char *e = getenv("DM_SCALE"); mode = e && !strcmp(e, "fill") ? 1 : e && !strcmp(e, "crop") ? 2 : 0; }
+    int W = (int)g_sext.width, H = (int)g_sext.height, dx, dy, dw, dh;
+    if (mode == 1) { dx = dy = 0; dw = W; dh = H; }
+    else { double s = mode == 2 ? fmax((double)W / cw, (double)H / ch) : fmin((double)W / cw, (double)H / ch);
+           dw = (int)(cw * s); dh = (int)(ch * s); dx = (W - dw) / 2; dy = (H - dh) / 2; }
+    int sx = cx, sy = cy, sw = cw, sh = ch;   // what of the source still lands in the window: a crop's overflow (and a fit with a rounded rect) lies outside it
+    if (dx < 0) { int k = (int)((double)-dx * sw / dw); sx += k; sw -= k; dx = 0; }
+    if (dy < 0) { int k = (int)((double)-dy * sh / dh); sy += k; sh -= k; dy = 0; }
+    if (dx + dw > W) { sw -= (int)((double)(dx + dw - W) * sw / dw); dw = W - dx; }
+    if (dy + dh > H) { sh -= (int)((double)(dy + dh - H) * sh / dh); dh = H - dy; }
+    if (sw < 1) sw = 1; if (sh < 1) sh = 1;
+    vk_pic_set((float)dx / W, (float)dy / H, (float)dw / W, (float)dh / H);
+    VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{sx, sy, 0}, {sx + sw, sy + sh, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
+    if (vk_window_bottom_up()) { b.srcOffsets[0].y = sy + sh; b.srcOffsets[1].y = sy; }   // lower-left origin: the window image is stored bottom-up (gfx_vk_exec.c)
     if (im->layout == VK_IMAGE_LAYOUT_UNDEFINED) { barrier(cb, im->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL); im->layout = VK_IMAGE_LAYOUT_GENERAL; }   // an imported frame buffer, first shown (gl_android.c)
     vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, tgt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
     VkImageLayout lay = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
