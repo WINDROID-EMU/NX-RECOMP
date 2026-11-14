@@ -233,10 +233,68 @@ static void go_foreground(void) { if (!atomic_load(&g_running) || !atomic_exchan
 void dm_perf_gpu_release(void);   // perf_android.c: the GPU's clock control back to its governor (DM_GPU_TURBO)
 // The clock control goes back after go_background: its dm_gfx_suspend waits for the presents in progress, and one of them could otherwise set the GPU's power control again
 static void on_pause(ANativeActivity *a) { (void)a; go_background(); dm_perf_gpu_release(); }
+static int jx(JNIEnv *E) { if (!(*E)->ExceptionCheck(E)) return 0; (*E)->ExceptionClear(E); return 1; }
+
+static void hide_system_navigation(ANativeActivity *a) {
+    if (!a || !a->clazz) return;
+    JNIEnv *E = a->env;
+    if (!E && a->vm && (*a->vm)->GetEnv(a->vm, (void **)&E, JNI_VERSION_1_6) != JNI_OK) {
+        if ((*a->vm)->AttachCurrentThread(a->vm, &E, NULL) != JNI_OK) return;
+    }
+    if (!E) return;
+    jclass cA = (*E)->GetObjectClass(E, a->clazz); if (jx(E) || !cA) return;
+    jmethodID mWin = (*E)->GetMethodID(E, cA, "getWindow", "()Landroid/view/Window;"); if (jx(E) || !mWin) return;
+    jobject w = (*E)->CallObjectMethod(E, a->clazz, mWin); if (jx(E) || !w) return;
+    jclass cW = (*E)->GetObjectClass(E, w); if (jx(E) || !cW) return;
+    jmethodID mDecor = (*E)->GetMethodID(E, cW, "getDecorView", "()Landroid/view/View;"); if (jx(E) || !mDecor) return;
+    jobject decor = (*E)->CallObjectMethod(E, w, mDecor); if (jx(E) || !decor) return;
+    jclass cV = (*E)->GetObjectClass(E, decor); if (jx(E) || !cV) return;
+
+    // View.setSystemUiVisibility (Android 4.4 - 15)
+    // SYSTEM_UI_FLAG_LAYOUT_STABLE (0x100) | SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION (0x200) |
+    // SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN (0x400) | SYSTEM_UI_FLAG_HIDE_NAVIGATION (0x2) |
+    // SYSTEM_UI_FLAG_FULLSCREEN (0x4) | SYSTEM_UI_FLAG_IMMERSIVE_STICKY (0x1000) = 0x1706
+    jmethodID mVis = (*E)->GetMethodID(E, cV, "setSystemUiVisibility", "(I)V");
+    if (!jx(E) && mVis) {
+        (*E)->CallVoidMethod(E, decor, mVis, (jint)0x1706);
+        jx(E);
+    }
+
+    // WindowInsetsController (Android 11+ / API 30+)
+    jmethodID mCtrl = (*E)->GetMethodID(E, cV, "getWindowInsetsController", "()Landroid/view/WindowInsetsController;");
+    if (!jx(E) && mCtrl) {
+        jobject ctrl = (*E)->CallObjectMethod(E, decor, mCtrl);
+        if (!jx(E) && ctrl) {
+            jclass cCtrl = (*E)->GetObjectClass(E, ctrl);
+            if (!jx(E) && cCtrl) {
+                jmethodID mHide = (*E)->GetMethodID(E, cCtrl, "hide", "(I)V");
+                jmethodID mBeh = (*E)->GetMethodID(E, cCtrl, "setSystemBarsBehavior", "(I)V");
+                if (!jx(E) && mHide) { (*E)->CallVoidMethod(E, ctrl, mHide, (jint)7); jx(E); }
+                if (!jx(E) && mBeh) { (*E)->CallVoidMethod(E, ctrl, mBeh, (jint)2); jx(E); }
+            }
+        }
+    }
+
+    // WindowManager.LayoutParams.layoutInDisplayCutoutMode = SHORT_EDGES (1)
+    jmethodID mAttr = (*E)->GetMethodID(E, cW, "getAttributes", "()Landroid/view/WindowManager$LayoutParams;");
+    if (!jx(E) && mAttr) {
+        jobject lp = (*E)->CallObjectMethod(E, w, mAttr);
+        if (!jx(E) && lp) {
+            jclass cLp = (*E)->GetObjectClass(E, lp);
+            jfieldID fCutout = cLp ? (*E)->GetFieldID(E, cLp, "layoutInDisplayCutoutMode", "I") : NULL;
+            if (!jx(E) && fCutout) {
+                (*E)->SetIntField(E, lp, fCutout, (jint)1);
+                jmethodID mSetAttr = (*E)->GetMethodID(E, cW, "setAttributes", "(Landroid/view/WindowManager$LayoutParams;)V");
+                if (!jx(E) && mSetAttr) { (*E)->CallVoidMethod(E, w, mSetAttr, lp); jx(E); }
+            }
+        }
+    }
+}
+
 // Back in front, the game is out of focus until the window has the input focus again (Android sends it after onResume): without this it stayed OutOfFocus for good,
 // and Blasphemous 2's Unity, which asks for focus notifications, kept its title paused and ignored every press after a trip to another app. A window losing focus while in
 // front (a system dialog, the notification shade) is OutOfFocus as on the Switch's HOME overlay
-static void on_window_focus(ANativeActivity *a, int focused) { (void)a; if (atomic_load(&g_running) && !atomic_load(&g_bg)) dm_focus_set(focused ? 1 : 2); }
+static void on_window_focus(ANativeActivity *a, int focused) { if (focused) hide_system_navigation(a); if (atomic_load(&g_running) && !atomic_load(&g_bg)) dm_focus_set(focused ? 1 : 2); }
 // A save manager's request, or a RomFS the app cannot read (romfs_readable), asked the app to end (ANativeActivity_onCreate): Activity.finish() when it is resumed, through JNI on the main thread.
 // ANativeActivity_finish, from onCreate or from here, left the activity on the screen (Y700, Android 16), and porter's am start -W waited out its timeout
 static int g_quit;
@@ -245,7 +303,7 @@ static void act_finish(ANativeActivity *a) {
     if (m) (*E)->CallVoidMethod(E, a->clazz, m);
     if (!m || (*E)->ExceptionCheck(E)) { (*E)->ExceptionClear(E); LOG("[RED] Activity.finish() failed: the app ends itself"); _exit(0); }
 }
-static void on_resume(ANativeActivity *a) { if (g_quit) { act_finish(a); return; } go_foreground(); }
+static void on_resume(ANativeActivity *a) { if (g_quit) { act_finish(a); return; } hide_system_navigation(a); go_foreground(); }
 static void on_destroy(ANativeActivity *a) { (void)a; dm_perf_gpu_release(); _exit(0); }   // one game per process
 
 // ---- input ----
@@ -451,7 +509,6 @@ static void menu_drag(const ov_ctl *m, float x, float y, float W, float H) {   /
 // when it is a gamepad or a joystick and not virtual (the tablet's own keys, touch screen and pen are neither), and once it has sent input: Xiaomi phones
 // keep a system device "uinput-xiaomi" attached for good that says it is a gamepad (issues #22, #210). The count controls vibration routing.
 // When the last used controller goes, the overlay can return and vibration returns to the phone ----
-static int jx(JNIEnv *E) { if (!(*E)->ExceptionCheck(E)) return 0; (*E)->ExceptionClear(E); return 1; }
 static void *pad_watch(void *a) {
     JavaVM *vm = a; JNIEnv *E; pthread_setname_np(pthread_self(), "padwatch");
     if ((*vm)->AttachCurrentThread(vm, &E, NULL) != JNI_OK) { LOG("[RED] [input] cannot attach to the Java VM: attached controllers are not watched"); return NULL; }
@@ -1335,6 +1392,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     act->callbacks->onInputQueueCreated = on_queue_created; act->callbacks->onInputQueueDestroyed = on_queue_destroyed;
     act->callbacks->onPause = on_pause; act->callbacks->onResume = on_resume; act->callbacks->onWindowFocusChanged = on_window_focus; act->callbacks->onDestroy = on_destroy;
     ANativeActivity_setWindowFlags(act, AWINDOW_FLAG_KEEP_SCREEN_ON | AWINDOW_FLAG_FULLSCREEN, 0);
+    hide_system_navigation(act);
     static int started; if (started++) return;   // a second onCreate (configuration change) keeps the running game
     JNIEnv *env = act->env;
     jclass activity_class = (*env)->GetObjectClass(env, act->clazz);
